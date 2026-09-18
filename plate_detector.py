@@ -1,58 +1,89 @@
+from __future__ import annotations
+
+import os
+import re
+import shutil
+from pathlib import Path
+
 import cv2
 import numpy as np
 import pytesseract
-import re
 
-# Path to local Tesseract installation
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+def configure_tesseract(command: str | None = None) -> str:
+    """Configure the Tesseract executable from a CLI argument, env var or PATH."""
+    candidate = command or os.getenv("TESSERACT_CMD") or shutil.which("tesseract")
+    if not candidate:
+        raise RuntimeError(
+            "Tesseract was not found. Install it and add it to PATH, "
+            "or provide --tesseract-cmd / set TESSERACT_CMD."
+        )
+
+    resolved = shutil.which(candidate) or candidate
+    if not Path(resolved).exists():
+        raise FileNotFoundError(f"Tesseract executable not found: {resolved}")
+
+    pytesseract.pytesseract.tesseract_cmd = str(resolved)
+    return str(resolved)
+
 
 def validar_string(input_string: str) -> bool:
-    # Validate Spanish license plate format: 4 digits + 3 uppercase letters
-    return bool(re.match(r"^\d{4}[A-Z]{3}$", input_string))
+    """Validate the current Spanish plate format: four digits and three letters."""
+    return bool(re.fullmatch(r"\d{4}[A-Z]{3}", input_string))
+
 
 def extract_license_plates(frame):
-    # Preprocess frame to highlight plate-like contours
+    """Return rectangular regions that resemble a license plate."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blur = cv2.bilateralFilter(gray, 11, 17, 17)
     edges = cv2.Canny(blur, 10, 120)
 
-    # Retrieve all contours for candidate filtering
     contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-
     plates = []
-    for cnt in contours:
-        # Approximate contour to polygon to find rectangular shapes
-        approx = cv2.approxPolyDP(cnt, 0.02 * cv2.arcLength(cnt, True), True)
-        if len(approx) == 4:
-            x, y, w, h = cv2.boundingRect(approx)
-            ar = w / h
-            # Geometric filtering based on aspect ratio and size
-            if 2 < ar < 5 and w > 80 and h > 20:
-                crop = frame[y:y+h, x:x+w]
-                plates.append((x, y, w, h, crop))
+
+    for contour in contours:
+        approx = cv2.approxPolyDP(
+            contour,
+            0.02 * cv2.arcLength(contour, True),
+            True,
+        )
+        if len(approx) != 4:
+            continue
+
+        x, y, width, height = cv2.boundingRect(approx)
+        aspect_ratio = width / height
+        if 2 < aspect_ratio < 5 and width > 80 and height > 20:
+            crop = frame[y : y + height, x : x + width]
+            plates.append((x, y, width, height, crop))
+
     return plates
 
+
 def extract_license_plate_text(plate_img):
-    # Ensure grayscale input for OCR
-    if len(plate_img.shape) == 3:
-        gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = plate_img.copy()
+    """Run OCR on a plate crop and return a validated Spanish plate."""
+    gray = (
+        cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
+        if len(plate_img.shape) == 3
+        else plate_img.copy()
+    )
 
-    # Enhance characters and binarize image
     blur = cv2.bilateralFilter(gray, 11, 17, 17)
-    _, thresh = cv2.threshold(
-        blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    _, threshold = cv2.threshold(
+        blur,
+        0,
+        255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
     )
 
-    # OCR configured for single-line alphanumeric text
     text = pytesseract.image_to_string(
-        thresh,
-        config="--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        threshold,
+        config=(
+            "--psm 7 "
+            "-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        ),
     )
 
-    # Clean OCR output and validate format
-    clean = "".join(c for c in text if c.isalnum()).upper()
+    clean = "".join(character for character in text if character.isalnum()).upper()
     if len(clean) >= 7:
         candidate = clean[-7:]
         if validar_string(candidate):
@@ -61,12 +92,10 @@ def extract_license_plate_text(plate_img):
 
 
 def detectar_matricula_en_frame(frame):
-    # Detect and decode first valid license plate in the frame
-    plates = extract_license_plates(frame)
-
-    for (x, y, w, h, plate_img) in plates:
+    """Detect and decode the first valid license plate in a frame."""
+    for x, y, width, height, plate_img in extract_license_plates(frame):
         code = extract_license_plate_text(plate_img)
         if code:
-            return code, (x, y, w, h)
+            return code, (x, y, width, height)
 
     return None, None

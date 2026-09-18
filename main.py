@@ -1,212 +1,282 @@
-import cv2
+from __future__ import annotations
+
+import argparse
 import time
+from pathlib import Path
 
-from security import check_security
-from line_detector import detectar_linea_continua
-from car_detector import detectar_coche
-from tracker import KalmanTracker
+import cv2
+
 import drawer
+from car_detector import detectar_coche
+from line_detector import detectar_linea_continua
+from plate_detector import configure_tesseract
+from security import check_security
+from tracker import KalmanTracker
 
 
-
-# Parameters
-
-MARGIN_LINEA = 30        # Pixel margin around the line considered as neutral zone
-FRAMES_ESTABLE = 8       # Consecutive frames required to confirm a stable side
-POST_CRUCE_TIME = 3.0   # Seconds to keep recording after crossing detection
+LINE_MARGIN = 30
+STABLE_FRAMES = 8
+POST_CROSSING_SECONDS = 3.0
+ACCESS_DELAY_SECONDS = 2.0
 
 
-def side_or_none(center, linea):
-    """
-    Returns relative position of a point with respect to a line:
-    LEFT, RIGHT, UP, DOWN or None if inside margin zone
-    """
-    x1, y1, x2, y2 = linea
+def parse_source(value: str) -> int | str:
+    """Interpret a numeric source as a camera index and any other value as a path."""
+    return int(value) if value.isdigit() else value
 
-    # Predominantly horizontal line
+
+def side_or_none(center, line):
+    """Return the stable side of a point relative to a detected line."""
+    x1, y1, x2, y2 = line
+
     if abs(x2 - x1) > abs(y2 - y1):
-        y_line = (y1 + y2) // 2
-        dy = center[1] - y_line
-        if abs(dy) < MARGIN_LINEA:
+        line_y = (y1 + y2) // 2
+        delta = center[1] - line_y
+        if abs(delta) < LINE_MARGIN:
             return None
-        return "UP" if dy < 0 else "DOWN"
+        return "UP" if delta < 0 else "DOWN"
 
-    # Predominantly vertical line
-    else:
-        x_line = (x1 + x2) // 2
-        dx = center[0] - x_line
-        if abs(dx) < MARGIN_LINEA:
-            return None
-        return "LEFT" if dx < 0 else "RIGHT"
+    line_x = (x1 + x2) // 2
+    delta = center[0] - line_x
+    if abs(delta) < LINE_MARGIN:
+        return None
+    return "LEFT" if delta < 0 else "RIGHT"
 
 
-def main():
-    # Video capture and tracker initialization
-    cap = cv2.VideoCapture(0)
-    tracker = KalmanTracker()
-
-    # Video writer for full recording
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    out = cv2.VideoWriter(
-        'grabacion_completa.avi',
-        fourcc,
-        20.0,
-        (
-            int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-            int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        )
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Detect vehicle crossings over a continuous line.",
     )
+    parser.add_argument("--source", default="0", help="Camera index or input video path.")
+    parser.add_argument(
+        "--output",
+        default="outputs/line_crossing_output.avi",
+        help="Path for the annotated output video.",
+    )
+    parser.add_argument(
+        "--authorized-plate",
+        default="",
+        help="Authorized Spanish plate. Required unless --skip-security is used.",
+    )
+    parser.add_argument(
+        "--skip-security",
+        action="store_true",
+        help="Skip plate access control and start line detection immediately.",
+    )
+    parser.add_argument(
+        "--tesseract-cmd",
+        default="",
+        help="Optional path to the Tesseract executable.",
+    )
+    return parser
 
-    linea = None
-    acceso = False
 
-    lado_inicial = None
-    contador_lado = 0
-    ultimo_lado = None
+def run(args: argparse.Namespace) -> None:
+    if not args.skip_security and not args.authorized_plate:
+        raise ValueError(
+            "Provide --authorized-plate or use --skip-security for the line-crossing demo."
+        )
 
-    cruce_detectado = False
-    t_cruce = None
+    if not args.skip_security:
+        configure_tesseract(args.tesseract_cmd or None)
 
-    matricula_detectada = None
-    bbox_matricula = None
-    tiempo_espera = 2.0
-    t_acceso = None
+    source = parse_source(args.source)
+    capture = cv2.VideoCapture(source)
+    if not capture.isOpened():
+        raise RuntimeError(f"Could not open video source: {args.source}")
 
+    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    source_fps = capture.get(cv2.CAP_PROP_FPS)
+    output_fps = source_fps if source_fps and source_fps > 1 else 20.0
+
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(
+        str(output_path),
+        cv2.VideoWriter_fourcc(*"XVID"),
+        output_fps,
+        (width, height),
+    )
+    if not writer.isOpened():
+        capture.release()
+        raise RuntimeError(f"Could not create output video: {output_path}")
+
+    tracker = KalmanTracker()
+    line = None
+    access_granted = args.skip_security
+    access_time = time.time() - ACCESS_DELAY_SECONDS if access_granted else None
+
+    initial_side = None
+    stable_side_count = 0
+    last_side = None
+    crossing_detected = False
+    crossing_time = None
+    detected_plate = None
+    plate_bbox = None
     frame_count = 0
-
-    # FPS variables
-    t_prev = time.time()
+    previous_time = time.time()
     fps = 0.0
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        # Real time FPS estimation
-        t_now = time.time()
-        dt = t_now - t_prev
-        t_prev = t_now
-        if dt > 0:
-            fps = 1.0 / dt
-
-        frame_count += 1
-
-      
-        # PHASE 1: SECURITY CHECK
-    
-        if not acceso:
-            if frame_count % 10 == 0:
-                ok, mat, bbox = check_security(frame)
-                if mat is not None and bbox is not None:
-                    matricula_detectada = mat
-                    bbox_matricula = bbox
-                if ok:
-                    acceso = True
-                    t_acceso = time.time()
-
-            if bbox_matricula is not None:
-                x, y, w, h = bbox_matricula
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 3)
-                cv2.putText(frame, matricula_detectada, (x, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-
-            cv2.putText(frame, "Scanning license plate...", (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-
-            drawer.draw_fps(frame, fps)
-            out.write(frame)
-            cv2.imshow("Sistema", frame)
-            if cv2.waitKey(1) == ord('q'):
+    try:
+        while True:
+            success, frame = capture.read()
+            if not success:
                 break
-            continue
 
-        
-        # WAIT AFTER ACCESS GRANTED 
-       
-        if time.time() - t_acceso < tiempo_espera:
-            cv2.putText(frame, "ACCESS GRANTED", (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
+            now = time.time()
+            elapsed = now - previous_time
+            previous_time = now
+            if elapsed > 0:
+                fps = 1.0 / elapsed
 
-            drawer.draw_fps(frame, fps)
-            out.write(frame)
-            cv2.imshow("Sistema", frame)
-            if cv2.waitKey(1) == ord('q'):
-                break
-            continue
+            frame_count += 1
 
-        
-        # LINE DETECTION (ONCE)
-        
-        if linea is None:
-            linea = detectar_linea_continua(frame)
+            if not access_granted:
+                if frame_count % 10 == 0:
+                    is_authorized, plate, bbox = check_security(
+                        frame,
+                        args.authorized_plate,
+                    )
+                    if plate is not None and bbox is not None:
+                        detected_plate = plate
+                        plate_bbox = bbox
+                    if is_authorized:
+                        access_granted = True
+                        access_time = time.time()
 
-        
-        # VEHICLE DETECTION + TRACKING
-        
-        bbox, center = detectar_coche(frame)
-        pred_center = None
-        if center is not None:
-            pred_center = tracker.update(center)
+                if plate_bbox is not None:
+                    x, y, box_width, box_height = plate_bbox
+                    color = (0, 255, 0) if access_granted else (0, 0, 255)
+                    cv2.rectangle(
+                        frame,
+                        (x, y),
+                        (x + box_width, y + box_height),
+                        color,
+                        3,
+                    )
+                    cv2.putText(
+                        frame,
+                        detected_plate,
+                        (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1.2,
+                        color,
+                        3,
+                    )
 
-        
-        # INITIAL SIDE STABILIZATION
-       
-        if linea is not None and pred_center is not None and lado_inicial is None:
-            lado = side_or_none(pred_center, linea)
+                cv2.putText(
+                    frame,
+                    "Scanning license plate...",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (255, 255, 0),
+                    2,
+                )
+                drawer.draw_fps(frame, fps)
+                writer.write(frame)
+                cv2.imshow("Line crossing detection", frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+                continue
 
-            if lado is None:
-                contador_lado = 0
-                ultimo_lado = None
-            else:
-                if lado == ultimo_lado:
-                    contador_lado += 1
+            if access_time is not None and time.time() - access_time < ACCESS_DELAY_SECONDS:
+                cv2.putText(
+                    frame,
+                    "ACCESS GRANTED",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    (0, 255, 0),
+                    3,
+                )
+                drawer.draw_fps(frame, fps)
+                writer.write(frame)
+                cv2.imshow("Line crossing detection", frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+                continue
+
+            if line is None:
+                line = detectar_linea_continua(frame)
+
+            bbox, center = detectar_coche(frame)
+            predicted_center = tracker.update(center) if center is not None else None
+
+            if line is not None and predicted_center is not None and initial_side is None:
+                current_side = side_or_none(predicted_center, line)
+                if current_side is None:
+                    stable_side_count = 0
+                    last_side = None
+                elif current_side == last_side:
+                    stable_side_count += 1
                 else:
-                    ultimo_lado = lado
-                    contador_lado = 1
+                    last_side = current_side
+                    stable_side_count = 1
 
-                if contador_lado >= FRAMES_ESTABLE:
-                    lado_inicial = lado
+                if stable_side_count >= STABLE_FRAMES:
+                    initial_side = current_side
 
-        
-        # LINE CROSSING DETECTION
-        
-        if lado_inicial is not None and pred_center is not None and not cruce_detectado:
-            lado_actual = side_or_none(pred_center, linea)
-            if lado_actual is not None and lado_actual != lado_inicial:
-                cruce_detectado = True
-                t_cruce = time.time()
-                print("CONTINUOUS LINE CROSSING DETECTED")
+            if (
+                initial_side is not None
+                and predicted_center is not None
+                and not crossing_detected
+            ):
+                current_side = side_or_none(predicted_center, line)
+                if current_side is not None and current_side != initial_side:
+                    crossing_detected = True
+                    crossing_time = time.time()
+                    print("CONTINUOUS LINE CROSSING DETECTED")
 
-       
-        # DRAWING AND OUTPUT
-        
-        drawer.draw_line(frame, linea)
-        drawer.draw_car(frame, bbox, pred_center)
+            drawer.draw_line(frame, line)
+            drawer.draw_car(frame, bbox, predicted_center)
 
-        if cruce_detectado:
-            text = "CONTINUOUS LINE CROSSING"
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            scale = 1.0
-            thickness = 3
-            (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
-            h, w, _ = frame.shape
-            cv2.putText(frame, text, ((w - tw)//2, (h + th)//2),
-                        font, scale, (0, 0, 255), thickness)
+            if crossing_detected:
+                text = "CONTINUOUS LINE CROSSING"
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                scale = 1.0
+                thickness = 3
+                (text_width, text_height), _ = cv2.getTextSize(
+                    text, font, scale, thickness
+                )
+                frame_height, frame_width, _ = frame.shape
+                cv2.putText(
+                    frame,
+                    text,
+                    (
+                        (frame_width - text_width) // 2,
+                        (frame_height + text_height) // 2,
+                    ),
+                    font,
+                    scale,
+                    (0, 0, 255),
+                    thickness,
+                )
 
-        drawer.draw_fps(frame, fps)
-        out.write(frame)
-        cv2.imshow("Sistema", frame)
+            drawer.draw_fps(frame, fps)
+            writer.write(frame)
+            cv2.imshow("Line crossing detection", frame)
 
-        if cruce_detectado and time.time() - t_cruce > POST_CRUCE_TIME:
-            break
+            if (
+                crossing_detected
+                and crossing_time is not None
+                and time.time() - crossing_time > POST_CROSSING_SECONDS
+            ):
+                break
 
-        if cv2.waitKey(1) == ord('q'):
-            break
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+    finally:
+        capture.release()
+        writer.release()
+        cv2.destroyAllWindows()
 
-    cap.release()
-    out.release()
-    cv2.destroyAllWindows()
+    print(f"Annotated video saved to: {output_path}")
+
+
+def main() -> None:
+    run(build_parser().parse_args())
 
 
 if __name__ == "__main__":

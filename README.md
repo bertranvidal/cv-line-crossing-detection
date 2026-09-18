@@ -1,81 +1,138 @@
-# Sistema de Visión por Ordenador para Control de Acceso y Detección de Cruce de Línea
+# Vehicle Line-Crossing Detection with OpenCV
 
-## Descripción
+A real-time computer-vision system that combines license-plate access control, continuous-line detection, vehicle tracking and crossing alerts using classical OpenCV techniques.
 
-Este proyecto implementa un sistema de visión por ordenador en tiempo real que utiliza una cámara para:
+The project deliberately avoids pretrained object detectors: vehicle motion is extracted with background subtraction, the reference line with Canny and Hough transforms, and the trajectory is stabilized with a Kalman filter.
 
-- Verificar el acceso mediante reconocimiento de matrículas.
-- Detectar una línea continua en la escena.
-- Detectar y seguir un vehículo en movimiento.
-- Detectar el cruce de la línea continua.
-- Grabar automáticamente el proceso completo en vídeo.
+## Pipeline
 
----
+```mermaid
+flowchart LR
+    V[Camera or video] --> P[Plate detection + OCR]
+    P --> A{Authorized?}
+    A -->|Yes| L[Line detection]
+    L --> D[Vehicle detection]
+    D --> T[Kalman tracking]
+    T --> C[Crossing decision]
+    C --> O[Annotated video]
+```
 
-## Estructura del proyecto
+## What it demonstrates
 
-### main.py
-Archivo principal. Controla el flujo completo del sistema, coordina los módulos, gestiona la grabación de vídeo y la visualización.
+- License-plate candidate detection from geometric contours
+- OCR with Tesseract and Spanish plate-format validation
+- Continuous-line detection with Canny edges and a probabilistic Hough transform
+- Moving-vehicle segmentation with MOG2 background subtraction
+- Constant-velocity tracking with an OpenCV Kalman filter
+- Stable side estimation with a neutral margin to avoid noisy crossing events
+- Real-time overlays, FPS reporting and annotated video export
 
-### security.py
-Implementa la fase de seguridad. Comprueba si la matrícula detectada coincide con la matrícula autorizada.
+## Demo videos
 
-### plate_detector.py
-Detección de matrículas y OCR. Extrae y valida el texto de la matrícula a partir de la imagen.
+- [Continuous-line crossing detection](videos/linea_continua.avi)
+- [Dashed-line control case](videos/linea_discontinua.avi)
+- [License-plate detection and OCR](videos/deteccion_matriculas.mp4)
+- [License-plate access control](videos/seguridad_matricula.avi)
 
-### line_detector.py
-Detección de la línea continua mediante técnicas clásicas (Canny + Hough).
+## Project structure
 
-### car_detector.py
-Detección del vehículo por movimiento usando sustracción de fondo.
+| File | Responsibility |
+| --- | --- |
+| `main.py` | CLI, video loop, state transitions, recording and visualization |
+| `plate_detector.py` | Plate-region detection, OCR and format validation |
+| `security.py` | Configurable authorized-plate comparison |
+| `line_detector.py` | Continuous-line detection with Canny and Hough |
+| `car_detector.py` | Motion-based vehicle detection |
+| `tracker.py` | Kalman-filter trajectory smoothing |
+| `drawer.py` | Bounding boxes, line, center point and FPS overlays |
+| `calibration.py` | Offline camera calibration from chessboard images |
 
-### tracker.py
-Seguimiento del vehículo mediante un filtro de Kalman para obtener una trayectoria estable.
+The full academic report is available in [Informe_Proyecto_Final_JavierBertran.pdf](Informe_Proyecto_Final_JavierBertran.pdf).
 
-### drawer.py
-Funciones de dibujo: línea, vehículo, centro y FPS.
+## Installation
 
-### calibration.py
-Script de calibración de cámara ejecutado de forma offline. No forma parte de la ejecución en tiempo real.
+Python 3.10 or newer is recommended.
 
----
+```bash
+git clone https://github.com/bertranvidal/cv-line-crossing-detection.git
+cd cv-line-crossing-detection
+python -m venv .venv
+```
 
-## Librerías utilizadas
+Activate the environment:
 
-- Python 3
-- OpenCV (cv2)
-- NumPy
-- Tesseract OCR
-- pytesseract
-- Librerías estándar de Python (time, re)
+```bash
+# Linux or macOS
+source .venv/bin/activate
+```
 
-Nota: El sistema de reconocimiento de matrículas utiliza Tesseract OCR, que debe estar instalado
-previamente en el sistema y correctamente configurado en el código.
+```powershell
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+```
 
----
+Install the Python dependencies:
 
-## Ejecución
+```bash
+pip install -r requirements.txt
+```
 
-Desde el directorio del proyecto, ejecutar:
+License-plate OCR also requires the native [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) executable. Add it to `PATH`, set `TESSERACT_CMD`, or pass `--tesseract-cmd`.
 
-python main.py
+## Usage
 
----
+### Run with a webcam
 
-## Vídeos de demostración
+```bash
+python main.py --source 0 --skip-security
+```
 
-En el repositorio se incluyen varios vídeos que muestran el funcionamiento del sistema en distintos escenarios.
+### Process a recorded video
 
-linea_continua.avi  
-Demostración del cruce de una línea continua. El vehículo es detectado y seguido y, al cruzar la línea, se activa la alerta correspondiente.
+```bash
+python main.py \
+  --source videos/linea_continua.avi \
+  --skip-security \
+  --output outputs/annotated_crossing.avi
+```
 
-linea_discontinua.avi  
-El vehículo cruza una línea discontinua. El sistema detecta el movimiento y el seguimiento, pero no genera ninguna alerta.
+### Enable license-plate access control
 
-deteccion_matriculas.mp4  
-Ejemplo del módulo de detección de matrículas y reconocimiento OCR, mostrando la localización de la matrícula y la lectura de los caracteres.
+```bash
+python main.py --source 0 --authorized-plate 0000AAA
+```
 
-seguridad_matricula.avi  
-Demostración del sistema de seguridad.  
-Cuando se presenta una matrícula no autorizada, el sistema bloquea el acceso.  
-Al mostrar la matrícula correcta, el acceso es concedido y se inicia la siguiente fase del sistema.
+If Tesseract is not on `PATH`:
+
+```powershell
+python main.py --source 0 --authorized-plate 0000AAA --tesseract-cmd "C:\Program Files\Tesseract-OCR\tesseract.exe"
+```
+
+Press `q` to stop. The annotated recording is written to `outputs/line_crossing_output.avi` by default.
+
+## Configuration
+
+| Argument | Purpose | Default |
+| --- | --- | --- |
+| `--source` | Camera index or video path | `0` |
+| `--output` | Annotated video path | `outputs/line_crossing_output.avi` |
+| `--authorized-plate` | Plate allowed through the security stage | None |
+| `--skip-security` | Run only detection, tracking and crossing logic | Disabled |
+| `--tesseract-cmd` | Explicit Tesseract executable path | `PATH` / `TESSERACT_CMD` |
+
+## Design assumptions and limitations
+
+- Motion detection assumes a mostly static camera.
+- The largest moving contour is treated as the vehicle, so the system is designed for one main vehicle at a time.
+- The longest Hough segment is treated as the reference line.
+- OCR is tuned for the current Spanish format of four digits and three letters.
+- Lighting, perspective, occlusion and camera movement can reduce accuracy.
+- This is a controlled academic prototype, not a production traffic-enforcement system.
+
+## Project context
+
+This was developed as a two-person university computer-vision project. Responsibilities overlapped across the system; my main focus was vehicle detection, line detection, crossing logic and integration of the final demo.
+
+## License
+
+Released under the [MIT License](LICENSE).
